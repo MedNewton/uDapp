@@ -1,0 +1,41 @@
+:root {
+    /* Core */
+    --bg-default: #0f0f0f;
+    --bg-paper: #151515;
+    --transparent-paper: rgba(21, 21, 21, 0.52);
+    --presale-card-bg: rgba(24, 24, 24, 1);
+  
+    /* Brand */
+    --urano-green-1: #5ebbc3;
+    --urano-green-2: #6de7c2;
+    --urano-gradient: linear-gradient(90deg, #5EBBC3 0%, #6DE7C2 100%);
+  
+    /* Text */
+    --text-primary: #ffffff;
+    --text-secondary: #9f9f9f;
+    --text-disabled: #f5f5f5;
+    --text-darker: #dedede;
+  
+    /* Borders */
+    --header-border: #242424;
+    --footer-border: #2e2e2e;
+    --card-border-1: #242424;
+    --card-border-2: linear-gradient(
+        0deg,
+        #242424,
+        #242424
+      ),
+      linear-gradient(
+        260.63deg,
+        rgba(107, 226, 194, 0.82) 2.15%,
+        rgba(0, 0, 0, 0) 52.96%,
+        #6BE2C2 100%
+      );
+  
+    /* Misc */
+    --divider: #000000;
+  
+    /* Typography */
+    --font-family: "Host Grotesk", system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+  }
+  

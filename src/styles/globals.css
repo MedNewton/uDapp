@@ -1,0 +1,16 @@
+@import "./tokens.css";
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-family);
+  background: var(--bg-default);
+  color: var(--text-primary);
+}
+
+* {
+  box-sizing: border-box;
+}
