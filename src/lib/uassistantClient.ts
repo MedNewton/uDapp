@@ -5,8 +5,37 @@ export type ChatMessage = Readonly<{
   content: string;
 }>;
 
+export type TxPreview = Readonly<{
+  chainId: number;
+  to: `0x${string}`;
+  data: `0x${string}`;
+  value: string; // bigint string
+}>;
+
+export type AssistantPlan = Readonly<{
+  id: string;
+  actionType:
+    | "STAKE"
+    | "UNSTAKE"
+    | "STAKE_ALL"
+    | "UNSTAKE_ALL"
+    | "BUY_USHARE"
+    | "SELL_USHARE"
+    | "VOTE"
+    | "CLAIM_UNLOCKED"
+    | "QUESTION"
+    | "UNSUPPORTED";
+  interpretation: string;
+  userMessage: string;
+  warnings: string[];
+  tx: TxPreview | null;
+  docsUrl?: string;
+  supportEmail?: string;
+}>;
+
 export type StreamEvent =
   | { type: "ready"; id?: string }
+  | { type: "plan"; plan: AssistantPlan }
   | { type: "delta"; delta: string }
   | { type: "done" }
   | { type: "error"; error: string; message?: string };
@@ -18,18 +47,20 @@ function assertEnv(name: string, value: string | undefined): string {
 }
 
 const API_BASE = (() => {
-  const raw = assertEnv("VITE_UASSISTANT_API_BASE", import.meta.env.VITE_UASSISTANT_API_BASE);
+  const raw = assertEnv(
+    "VITE_UASSISTANT_API_BASE",
+    import.meta.env.VITE_UASSISTANT_API_BASE
+  );
   return raw.endsWith("/") ? raw.slice(0, -1) : raw;
 })();
 
 const API_KEY = (() => {
-  // optional for local dev if your backend allows it, but we’ll require it here
   return assertEnv("VITE_UASSISTANT_API_KEY", import.meta.env.VITE_UASSISTANT_API_KEY);
 })();
 
 /**
  * Streams assistant output from /chat/stream as Server-Sent Events (SSE).
- * Calls `onEvent` for ready/delta/done/error.
+ * Calls `onEvent` for ready/plan/delta/done/error.
  */
 export async function streamChat(args: Readonly<{
   messages: readonly ChatMessage[];
@@ -42,7 +73,7 @@ export async function streamChat(args: Readonly<{
     method: "POST",
     headers: {
       "content-type": "application/json",
-      "accept": "text/event-stream",
+      accept: "text/event-stream",
       "x-api-key": API_KEY,
     },
     body: JSON.stringify({ messages }),
@@ -59,12 +90,10 @@ export async function streamChat(args: Readonly<{
   const reader = res.body.getReader();
   const decoder = new TextDecoder("utf-8");
 
-  // SSE parsing (event: X\n data: Y\n\n)
   let buf = "";
   let currentEvent: string | null = null;
 
   const flushBlock = (block: string): void => {
-    // block may have multiple lines; we care about `event:` and `data:`
     const lines = block.split("\n");
     let ev: string | null = null;
     const dataLines: string[] = [];
@@ -76,7 +105,6 @@ export async function streamChat(args: Readonly<{
 
     const dataRaw = dataLines.join("\n").trim();
     const eventName = (ev ?? currentEvent ?? "").trim();
-
     if (!eventName) return;
 
     if (eventName === "ready") {
@@ -89,12 +117,22 @@ export async function streamChat(args: Readonly<{
       return;
     }
 
+    if (eventName === "plan") {
+      try {
+        const parsed = JSON.parse(dataRaw) as AssistantPlan;
+        onEvent({ type: "plan", plan: parsed });
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        onEvent({ type: "error", error: "PLAN_PARSE_FAILED", message: msg });
+      }
+      return;
+    }
+
     if (eventName === "delta") {
       try {
         const parsed = JSON.parse(dataRaw) as { delta?: string };
         onEvent({ type: "delta", delta: parsed.delta ?? "" });
       } catch {
-        // fallback if backend ever sends plain text
         onEvent({ type: "delta", delta: dataRaw });
       }
       return;
@@ -108,7 +146,11 @@ export async function streamChat(args: Readonly<{
     if (eventName === "error") {
       try {
         const parsed = JSON.parse(dataRaw) as { error?: string; message?: string };
-        onEvent({ type: "error", error: parsed.error ?? "ERROR", message: parsed.message });
+        onEvent({
+          type: "error",
+          error: parsed.error ?? "ERROR",
+          message: parsed.message,
+        });
       } catch {
         onEvent({ type: "error", error: "ERROR", message: dataRaw });
       }
@@ -123,14 +165,11 @@ export async function streamChat(args: Readonly<{
 
       buf += decoder.decode(value, { stream: true });
 
-      // SSE blocks are separated by double newlines
       let idx: number;
       while ((idx = buf.indexOf("\n\n")) !== -1) {
         const block = buf.slice(0, idx).trimEnd();
         buf = buf.slice(idx + 2);
 
-        // allow event name to persist if backend splits strangely
-        // (not required, but harmless)
         if (block.includes("event:")) {
           const m = block.match(/^event:\s*(.+)$/m);
           currentEvent = m?.[1]?.trim() ?? currentEvent;
