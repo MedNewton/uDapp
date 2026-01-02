@@ -6,22 +6,6 @@ export type ChatMessage = Readonly<{
   content: string;
 }>;
 
-export type VestingData = Readonly<{
-  beneficiary: `0x${string}`;
-  totalAmount: string; // uint256 string
-  cliffInSeconds: string; // uint256 string
-  vestingInSeconds: string; // uint256 string
-  tgePercentage: string; // uint256 string
-}>;
-
-export type ChatContext = Readonly<{
-  account?: `0x${string}`;
-  vesting?: Readonly<{
-    data: VestingData;
-    merkleProof: readonly `0x${string}`[];
-  }>;
-}>;
-
 export type TxPreview = Readonly<{
   chainId: number;
   to: `0x${string}`;
@@ -46,11 +30,11 @@ export type AssistantPlan = Readonly<{
   userMessage: string;
   warnings: string[];
 
-  // new (multi-tx capable)
-  txs: readonly TxPreview[];
+  // new (multi-tx)
+  txs?: TxPreview[];
 
-  // backwards compatibility
-  tx: TxPreview | null;
+  // legacy (single tx)
+  tx?: TxPreview | null;
 
   docsUrl?: string;
   supportEmail?: string;
@@ -70,10 +54,7 @@ function assertEnv(name: string, value: string | undefined): string {
 }
 
 const API_BASE = (() => {
-  const raw = assertEnv(
-    "VITE_UASSISTANT_API_BASE",
-    import.meta.env.VITE_UASSISTANT_API_BASE
-  );
+  const raw = assertEnv("VITE_UASSISTANT_API_BASE", import.meta.env.VITE_UASSISTANT_API_BASE);
   return raw.endsWith("/") ? raw.slice(0, -1) : raw;
 })();
 
@@ -83,11 +64,10 @@ const API_KEY = (() => {
 
 export async function streamChat(args: Readonly<{
   messages: readonly ChatMessage[];
-  context?: ChatContext;
   signal?: AbortSignal;
   onEvent: (evt: StreamEvent) => void;
 }>): Promise<void> {
-  const { messages, context, signal, onEvent } = args;
+  const { messages, signal, onEvent } = args;
 
   const res = await fetch(`${API_BASE}/chat/stream`, {
     method: "POST",
@@ -96,7 +76,7 @@ export async function streamChat(args: Readonly<{
       accept: "text/event-stream",
       "x-api-key": API_KEY,
     },
-    body: JSON.stringify({ messages, ...(context ? { context } : {}) }),
+    body: JSON.stringify({ messages }),
     signal,
   });
 
@@ -142,7 +122,11 @@ export async function streamChat(args: Readonly<{
         const parsed = JSON.parse(dataRaw) as AssistantPlan;
         onEvent({ type: "plan", plan: parsed });
       } catch {
-        onEvent({ type: "error", error: "BAD_PLAN_EVENT", message: "Could not parse plan payload." });
+        onEvent({
+          type: "error",
+          error: "BAD_PLAN_EVENT",
+          message: "Could not parse plan payload.",
+        });
       }
       return;
     }
