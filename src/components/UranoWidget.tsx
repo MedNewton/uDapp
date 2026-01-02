@@ -489,6 +489,8 @@ export default function UranoWidget(): React.ReactElement {
    */
   async function sendPlanToWallet(plan: AssistantPlan): Promise<void> {
     const txs = getPlanTxs(plan);
+    console.log(plan)
+    console.log(txs)
     if (txs.length === 0) throw new Error("No transaction(s) to send.");
     if (!account?.address) throw new Error("Connect your wallet first.");
 
