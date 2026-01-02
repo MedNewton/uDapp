@@ -344,6 +344,8 @@ export default function UranoWidget(): React.ReactElement {
         signal: ac.signal,
         onEvent: (evt: StreamEvent) => {
           if (evt.type === "plan") {
+            console.log("PLAN:", evt.plan);
+            console.log("TXS:", evt.plan.txs, "TX:", evt.plan.tx);
             planReceived = true;
 
             const plan = evt.plan;
@@ -699,8 +701,8 @@ export default function UranoWidget(): React.ReactElement {
             {isSendingTx
               ? "Sending…"
               : account
-              ? `Send ${txs.length} tx${txs.length > 1 ? "s" : ""} to wallet`
-              : "Connect wallet"}
+                ? `Send ${txs.length} tx${txs.length > 1 ? "s" : ""} to wallet`
+                : "Connect wallet"}
           </button>
 
           {plan.docsUrl ? (
@@ -750,10 +752,10 @@ export default function UranoWidget(): React.ReactElement {
                   m.role === "assistant"
                     ? "uw-msg-assistant"
                     : m.role === "user"
-                    ? "uw-msg-user"
-                    : m.role === "error"
-                    ? "uw-msg-error"
-                    : "uw-msg-system",
+                      ? "uw-msg-user"
+                      : m.role === "error"
+                        ? "uw-msg-error"
+                        : "uw-msg-system",
                 ].join(" ")}
               >
                 {m.text}
