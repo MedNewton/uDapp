@@ -22,9 +22,13 @@ import { defineChain, prepareTransaction } from "thirdweb";
 
 /* ----------------------------- Types ----------------------------- */
 
+type MsgRole = "assistant" | "user";
+type MsgKind = "normal" | "status" | "error";
+
 type Msg = Readonly<{
   id: string;
-  role: "assistant" | "user";
+  role: MsgRole;
+  kind: MsgKind;
   text: string;
   /**
    * Only attach plan when it is ACTIONABLE (plan.tx !== null and not QUESTION/UNSUPPORTED).
@@ -181,16 +185,11 @@ export default function UranoWidget(): React.ReactElement {
   const [isSendingTx, setIsSendingTx] = useState<boolean>(false);
 
   const [messages, setMessages] = useState<Msg[]>(() => [
-    { id: crypto.randomUUID(), role: "assistant", text: "Hello. How can I help you today?" },
+    { id: crypto.randomUUID(), role: "assistant", kind: "normal", text: "Hello. How can I help you today?" },
   ]);
 
   const listRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
-
-  // CRITICAL FIX:
-  // If backend sends both "plan" then "delta" (compat event), we must ignore deltas
-  // once we received a plan for that assistant message, even if plan is non-actionable.
-  const ignoreDeltasForMsgRef = useRef<Set<string>>(new Set());
 
   // Thirdweb
   const account = useActiveAccount();
@@ -205,7 +204,10 @@ export default function UranoWidget(): React.ReactElement {
     el.scrollTop = el.scrollHeight;
   }, [open, messages.length]);
 
-  const canSend = useMemo(() => input.trim().length > 0 && !isStreaming, [input, isStreaming]);
+  const canSend = useMemo(
+    () => input.trim().length > 0 && !isStreaming,
+    [input, isStreaming]
+  );
 
   function toggle(): void {
     setOpen((v) => !v);
@@ -220,22 +222,27 @@ export default function UranoWidget(): React.ReactElement {
 
   function buildPayload(nextMsgs: readonly Msg[]): ChatMessage[] {
     const sliced = nextMsgs.slice(Math.max(0, nextMsgs.length - MAX_HISTORY));
-    return sliced.map((m) => ({ role: m.role, content: m.text })) satisfies ChatMessage[];
+    return sliced
+      .filter((m) => m.kind === "normal") // Only send real conversation content to the planner
+      .map((m) => ({ role: m.role, content: m.text })) satisfies ChatMessage[];
   }
 
-  function appendToAssistantMessage(assistantMsgId: string, extra: string): void {
-    setMessages((prev) =>
-      prev.map((m) => (m.id === assistantMsgId ? { ...m, text: `${m.text}\n\n${extra}` } : m))
-    );
+  function pushMessage(msg: Msg): void {
+    setMessages((prev) => [...prev, msg]);
+  }
+
+  function pushAssistantStatus(text: string): void {
+    pushMessage({ id: crypto.randomUUID(), role: "assistant", kind: "status", text });
+  }
+
+  function pushAssistantError(text: string): void {
+    pushMessage({ id: crypto.randomUUID(), role: "assistant", kind: "error", text });
   }
 
   async function startStreaming(payload: ChatMessage[], assistantId: string): Promise<void> {
     abortRef.current?.abort();
     const ac = new AbortController();
     abortRef.current = ac;
-
-    // ensure clean state for this assistant message
-    ignoreDeltasForMsgRef.current.delete(assistantId);
 
     setIsStreaming(true);
 
@@ -247,13 +254,11 @@ export default function UranoWidget(): React.ReactElement {
           if (evt.type === "plan") {
             const plan = evt.plan;
 
-            // IMPORTANT: once we got a plan for this assistant message, ignore deltas
-            ignoreDeltasForMsgRef.current.add(assistantId);
-
             setMessages((prev) =>
               prev.map((m) => {
                 if (m.id !== assistantId) return m;
 
+                // always show assistant text (even if non-actionable)
                 const text = plan.userMessage ?? "";
 
                 // attach plan ONLY if actionable => card only for real transactions
@@ -267,9 +272,6 @@ export default function UranoWidget(): React.ReactElement {
           }
 
           if (evt.type === "delta") {
-            // CRITICAL FIX: do not append delta after plan
-            if (ignoreDeltasForMsgRef.current.has(assistantId)) return;
-
             const delta = evt.delta ?? "";
             if (!delta) return;
 
@@ -312,7 +314,6 @@ export default function UranoWidget(): React.ReactElement {
         );
       }
     } finally {
-      ignoreDeltasForMsgRef.current.delete(assistantId);
       if (abortRef.current === ac) abortRef.current = null;
       setIsStreaming(false);
     }
@@ -322,9 +323,9 @@ export default function UranoWidget(): React.ReactElement {
     const text = input.trim();
     if (!text || isStreaming) return;
 
-    const userMsg: Msg = { id: crypto.randomUUID(), role: "user", text };
+    const userMsg: Msg = { id: crypto.randomUUID(), role: "user", kind: "normal", text };
     const assistantId = crypto.randomUUID();
-    const assistantPlaceholder: Msg = { id: assistantId, role: "assistant", text: "" };
+    const assistantPlaceholder: Msg = { id: assistantId, role: "assistant", kind: "normal", text: "" };
 
     setMessages((prev) => [...prev, userMsg, assistantPlaceholder]);
     setInput("");
@@ -374,9 +375,7 @@ export default function UranoWidget(): React.ReactElement {
       });
 
       const approveRes = await sendTx(approveTx);
-      if (!isSendTxResult(approveRes)) {
-        throw new Error("Unexpected approve result (missing transactionHash).");
-      }
+      if (!isSendTxResult(approveRes)) throw new Error("Unexpected approve result (missing transactionHash).");
 
       const approveReceipt = await waitForReceipt({ rpcUrl, txHash: approveRes.transactionHash });
       if (approveReceipt.status && approveReceipt.status !== "0x1") {
@@ -400,9 +399,7 @@ export default function UranoWidget(): React.ReactElement {
       });
 
       const approveRes = await sendTx(approveTx);
-      if (!isSendTxResult(approveRes)) {
-        throw new Error("Unexpected approve result (missing transactionHash).");
-      }
+      if (!isSendTxResult(approveRes)) throw new Error("Unexpected approve result (missing transactionHash).");
 
       const approveReceipt = await waitForReceipt({ rpcUrl, txHash: approveRes.transactionHash });
       if (approveReceipt.status && approveReceipt.status !== "0x1") {
@@ -421,9 +418,7 @@ export default function UranoWidget(): React.ReactElement {
     });
 
     const res = await sendTx(tx);
-    if (!isSendTxResult(res)) {
-      throw new Error("Unexpected send result (missing transactionHash).");
-    }
+    if (!isSendTxResult(res)) throw new Error("Unexpected send result (missing transactionHash).");
 
     const receipt = await waitForReceipt({ rpcUrl, txHash: res.transactionHash });
     if (receipt.status && receipt.status !== "0x1") {
@@ -431,23 +426,31 @@ export default function UranoWidget(): React.ReactElement {
     }
   }
 
-  async function onClickSendToWallet(plan: AssistantPlan, assistantMsgId: string): Promise<void> {
+  async function onClickSendToWallet(plan: AssistantPlan): Promise<void> {
+    if (!plan.tx) return;
+
     setIsSendingTx(true);
     try {
-      appendToAssistantMessage(assistantMsgId, "Preparing transaction…");
+      // IMPORTANT: independent message (not appended to the plan message)
+      pushAssistantStatus("Preparing transaction…");
+
       await sendPlanToWallet(plan);
-      appendToAssistantMessage(assistantMsgId, "Transaction confirmed.");
+
+      // IMPORTANT: independent message (not appended)
+      pushAssistantStatus("Transaction confirmed.");
     } catch (e: unknown) {
       const raw = e instanceof Error ? e.message : String(e);
       const sig = extractErrorSignature(raw);
-      const extra = sig ? `Revert selector: ${sig}\nLookup: https://openchain.xyz/signatures?query=${sig}` : "";
-      appendToAssistantMessage(assistantMsgId, `Could not send transaction: ${raw}${extra ? `\n\n${extra}` : ""}`);
+      const extra = sig ? `\nRevert selector: ${sig}\nLookup: https://openchain.xyz/signatures?query=${sig}` : "";
+
+      // IMPORTANT: independent ERROR message (not appended)
+      pushAssistantError(`Could not send transaction: ${raw}${extra}`);
     } finally {
       setIsSendingTx(false);
     }
   }
 
-  function renderAssistantPlan(plan: AssistantPlan, assistantMsgId: string): React.ReactElement {
+  function renderAssistantPlan(plan: AssistantPlan): React.ReactElement {
     if (!plan.tx) return <></>;
 
     const label = actionLabel(plan.actionType);
@@ -546,7 +549,7 @@ export default function UranoWidget(): React.ReactElement {
           <button
             type="button"
             disabled={!canSendWallet}
-            onClick={() => void onClickSendToWallet(plan, assistantMsgId)}
+            onClick={() => void onClickSendToWallet(plan)}
             style={{
               height: 38,
               padding: "0 12px",
@@ -559,7 +562,7 @@ export default function UranoWidget(): React.ReactElement {
               opacity: canSendWallet ? 1 : 0.6,
             }}
           >
-            {isSendingTx ? "Sending…" : "Send to wallet"}
+            {isSendingTx ? "Sending…" : account ? "Send to wallet" : "Connect wallet first"}
           </button>
 
           {plan.docsUrl ? (
@@ -570,6 +573,13 @@ export default function UranoWidget(): React.ReactElement {
         </div>
       </div>
     );
+  }
+
+  function msgClassName(m: Msg): string {
+    const base = ["uw-msg", m.role === "assistant" ? "uw-msg-assistant" : "uw-msg-user"];
+    if (m.kind === "status") base.push("uw-msg-status");
+    if (m.kind === "error") base.push("uw-msg-error");
+    return base.join(" ");
   }
 
   return (
@@ -598,11 +608,11 @@ export default function UranoWidget(): React.ReactElement {
 
           <div className="uw-messages" ref={listRef}>
             {messages.map((m) => (
-              <div key={m.id} className={["uw-msg", m.role === "assistant" ? "uw-msg-assistant" : "uw-msg-user"].join(" ")}>
+              <div key={m.id} className={msgClassName(m)}>
                 {m.text}
 
-                {/* GUARANTEE: card renders ONLY if plan exists AND plan.tx exists */}
-                {m.role === "assistant" && m.plan?.tx ? renderAssistantPlan(m.plan, m.id) : null}
+                {/* Card renders ONLY if plan exists AND plan.tx exists */}
+                {m.role === "assistant" && m.kind === "normal" && m.plan?.tx ? renderAssistantPlan(m.plan) : null}
               </div>
             ))}
           </div>
