@@ -7,6 +7,11 @@ function assertEnv(name: string, value: string | undefined): string {
   return v;
 }
 
+/**
+ * IMPORTANT:
+ * Set VITE_THIRDWEB_CLIENT_ID in your frontend .env
+ * (thirdweb dashboard -> client id)
+ */
 export const thirdwebClient = createThirdwebClient({
   clientId: assertEnv("VITE_THIRDWEB_CLIENT_ID", import.meta.env.VITE_THIRDWEB_CLIENT_ID),
 });
