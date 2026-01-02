@@ -62,7 +62,7 @@ const MAX_HISTORY = 30;
 function uid(): string {
   const c = globalThis.crypto;
   if (c && typeof c.randomUUID === "function") return c.randomUUID();
-  // Fallback: not cryptographically strong, but good enough for UI ids.
+  // Fallback (UI-only)
   return `id_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
@@ -121,7 +121,6 @@ function isActionablePlan(plan: AssistantPlan): boolean {
 
 /** Extract first uint256 arg from calldata: 0x + 4-byte selector + 32-byte arg0 + ... */
 function decodeFirstUint256Arg(data: `0x${string}`): bigint {
-  // "0x" + 8 hex selector = 10 chars, then arg0 64 hex chars
   if (data.length < 10 + 64) throw new Error("Invalid calldata (too short)");
   const arg0 = data.slice(10, 10 + 64);
   return BigInt(`0x${arg0}`);
@@ -173,7 +172,6 @@ function parseUint256Hex(result: unknown): bigint {
 }
 
 function pickRpcUrls(): string[] {
-  // Prefer your env, then Base Sepolia defaults + fallback publicnode.
   const envRpc = (import.meta.env.VITE_RPC_URL as string | undefined)?.trim();
   const list = [
     envRpc && envRpc.length > 0 ? envRpc : null,
@@ -181,7 +179,6 @@ function pickRpcUrls(): string[] {
     "https://base-sepolia-rpc.publicnode.com",
   ].filter(Boolean) as string[];
 
-  // de-dupe
   return Array.from(new Set(list));
 }
 
@@ -224,7 +221,6 @@ async function rpcCallWithFallback<T>(
 }
 
 async function rpcGetReceipt(args: Readonly<{ txHash: `0x${string}`; signal?: AbortSignal }>): Promise<{
-  rpcUrl: string;
   receipt: RpcReceipt | null;
 }> {
   const payload = {
@@ -234,12 +230,11 @@ async function rpcGetReceipt(args: Readonly<{ txHash: `0x${string}`; signal?: Ab
     params: [args.txHash],
   };
 
-  const { rpcUrl, result } = await rpcCallWithFallback<RpcReceipt | null>(payload, args.signal);
-  return { rpcUrl, receipt: result ?? null };
+  const { result } = await rpcCallWithFallback<RpcReceipt | null>(payload, args.signal);
+  return { receipt: result ?? null };
 }
 
 async function waitForReceipt(args: Readonly<{ txHash: `0x${string}`; signal?: AbortSignal }>): Promise<{
-  rpcUrl: string;
   receipt: RpcReceipt;
 }> {
   const maxTries = 60;
@@ -247,7 +242,7 @@ async function waitForReceipt(args: Readonly<{ txHash: `0x${string}`; signal?: A
 
   for (let i = 0; i < maxTries; i += 1) {
     const { receipt } = await rpcGetReceipt({ txHash: args.txHash, signal: args.signal });
-    if (receipt) return { rpcUrl: "", receipt };
+    if (receipt) return { receipt };
 
     await new Promise<void>((resolve, reject) => {
       const t = window.setTimeout(() => resolve(), delayMs);
@@ -319,7 +314,7 @@ export default function UranoWidget(): React.ReactElement {
     const el = listRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [open, messages]);
+  }, [open, messages.length]);
 
   const canSend = useMemo(
     () => input.trim().length > 0 && !isStreaming && !isSendingTx,
@@ -434,7 +429,7 @@ export default function UranoWidget(): React.ReactElement {
 
     setInput("");
 
-    // Use ref to avoid stale state when sending quickly during streaming updates.
+    // Prevent stale state issues when sending during rapid updates
     const base = messagesRef.current;
     const nextForPayload = [...base, userMsg];
     const payload = buildPayload(nextForPayload);
@@ -444,10 +439,10 @@ export default function UranoWidget(): React.ReactElement {
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>): void {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      onSend();
-    }
+    if (e.key !== "Enter") return;
+    if (e.shiftKey) return;
+    e.preventDefault();
+    onSend();
   }
 
   async function erc20ReadUint256(args: { token: HexAddress; data: `0x${string}` }): Promise<bigint> {
@@ -462,26 +457,26 @@ export default function UranoWidget(): React.ReactElement {
     return parseUint256Hex(result);
   }
 
-  async function preflightStake(args: {
+  async function getAllowance(args: {
     token: HexAddress;
     owner: HexAddress;
     spender: HexAddress;
+  }): Promise<bigint> {
+    return erc20ReadUint256({
+      token: args.token,
+      data: encodeAllowance(args.owner, args.spender),
+    });
+  }
+
+  async function preflightStakeBalance(args: {
+    token: HexAddress;
+    owner: HexAddress;
     amountWei: bigint;
   }): Promise<void> {
-    const [bal, allow] = await Promise.all([
-      erc20ReadUint256({ token: args.token, data: encodeBalanceOf(args.owner) }),
-      erc20ReadUint256({ token: args.token, data: encodeAllowance(args.owner, args.spender) }),
-    ]);
-
+    const bal = await erc20ReadUint256({ token: args.token, data: encodeBalanceOf(args.owner) });
     if (bal < args.amountWei) {
       throw new Error(
         `Insufficient URANO balance. You have ${bal.toString()} wei, need ${args.amountWei.toString()} wei.`
-      );
-    }
-
-    if (allow < args.amountWei) {
-      throw new Error(
-        `Allowance is insufficient. Allowance=${allow.toString()} wei, need ${args.amountWei.toString()} wei.`
       );
     }
   }
@@ -489,8 +484,8 @@ export default function UranoWidget(): React.ReactElement {
   /**
    * Sends plan to wallet.
    * - Supports multi-tx plans (plan.txs) and legacy single tx (plan.tx).
-   * - For BUY_USHARE we do NOT do an extra client-side approval anymore (backend already returns approve+buy).
-   * - For STAKE we keep the client-side URANO approve BEFORE staking tx (only if needed).
+   * - For BUY_USHARE we do NOT do an extra client-side approval anymore (backend returns approve+buy).
+   * - For STAKE we do a client-side URANO approve ONLY if allowance is insufficient.
    */
   async function sendPlanToWallet(plan: AssistantPlan): Promise<void> {
     const txs = getPlanTxs(plan);
@@ -500,7 +495,6 @@ export default function UranoWidget(): React.ReactElement {
     const chainId = txs[0]!.chainId;
     const chain = defineChain(chainId);
 
-    // enforce single-chain batch
     for (const t of txs) {
       if (t.chainId !== chainId) {
         throw new Error("Plan contains transactions on multiple chains (not supported).");
@@ -513,7 +507,7 @@ export default function UranoWidget(): React.ReactElement {
 
     const owner = account.address as HexAddress;
 
-    // -------- Optional pre-step for STAKE only (client-side approve) --------
+    // -------- Optional pre-step for STAKE only (approve if needed) --------
     if (plan.actionType === "STAKE") {
       const tokenRaw = (import.meta.env.VITE_URANO_TOKEN as string | undefined)?.trim();
       if (!tokenRaw || !isHexAddress(tokenRaw)) {
@@ -521,36 +515,42 @@ export default function UranoWidget(): React.ReactElement {
       }
 
       const stakingTx = txs[0]!;
+      const spender = stakingTx.to as HexAddress;
       const stakeAmountWei = decodeFirstUint256Arg(stakingTx.data);
 
-      pushMessage({ id: uid(), role: "system", text: "Preparing approval…" });
+      // Balance check first
+      await preflightStakeBalance({ token: tokenRaw, owner, amountWei: stakeAmountWei });
 
-      const approveTx = prepareTransaction({
-        client: thirdwebClient,
-        chain,
-        to: tokenRaw,
-        data: encodeErc20Approve(stakingTx.to as HexAddress, stakeAmountWei),
-        value: 0n,
-      });
+      const currentAllowance = await getAllowance({ token: tokenRaw, owner, spender });
 
-      const approveRes = await sendTx(approveTx);
-      if (!isSendTxResult(approveRes)) {
-        throw new Error("Unexpected approve result (missing transactionHash).");
+      if (currentAllowance < stakeAmountWei) {
+        pushMessage({ id: uid(), role: "system", text: "Preparing approval…" });
+
+        const approveTx = prepareTransaction({
+          client: thirdwebClient,
+          chain,
+          to: tokenRaw,
+          data: encodeErc20Approve(spender, stakeAmountWei),
+          value: 0n,
+        });
+
+        const approveRes = await sendTx(approveTx);
+        if (!isSendTxResult(approveRes)) {
+          throw new Error("Unexpected approve result (missing transactionHash).");
+        }
+
+        const { receipt: approveReceipt } = await waitForReceipt({ txHash: approveRes.transactionHash });
+        if (approveReceipt.status && approveReceipt.status !== "0x1") {
+          throw new Error(`Approve reverted (status=${approveReceipt.status}).`);
+        }
+
+        pushMessage({ id: uid(), role: "system", text: "Approval confirmed." });
+
+        const newAllowance = await getAllowance({ token: tokenRaw, owner, spender });
+        if (newAllowance < stakeAmountWei) {
+          throw new Error("Approval did not increase allowance as expected.");
+        }
       }
-
-      const { receipt: approveReceipt } = await waitForReceipt({ txHash: approveRes.transactionHash });
-      if (approveReceipt.status && approveReceipt.status !== "0x1") {
-        throw new Error(`Approve reverted (status=${approveReceipt.status}).`);
-      }
-
-      pushMessage({ id: uid(), role: "system", text: "Approval confirmed." });
-
-      await preflightStake({
-        token: tokenRaw,
-        owner,
-        spender: stakingTx.to as HexAddress,
-        amountWei: stakeAmountWei,
-      });
     }
 
     // -------- Send plan txs in order --------
@@ -631,7 +631,9 @@ export default function UranoWidget(): React.ReactElement {
           </div>
         </div>
 
-        <div style={{ marginTop: 6, fontSize: 12, color: "var(--text-secondary)" }}>{plan.interpretation}</div>
+        <div style={{ marginTop: 6, fontSize: 12, color: "var(--text-secondary)" }}>
+          {plan.interpretation}
+        </div>
 
         {plan.warnings?.length > 0 && (
           <div
@@ -674,17 +676,23 @@ export default function UranoWidget(): React.ReactElement {
             <div style={{ display: "grid", gap: 6 }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
                 <span style={{ color: "var(--text-secondary)" }}>Chain</span>
-                <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>{t.chainId}</span>
+                <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                  {t.chainId}
+                </span>
               </div>
 
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
                 <span style={{ color: "var(--text-secondary)" }}>To</span>
-                <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>{shortHex(t.to)}</span>
+                <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                  {shortHex(t.to)}
+                </span>
               </div>
 
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
                 <span style={{ color: "var(--text-secondary)" }}>Value</span>
-                <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>{t.value}</span>
+                <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                  {t.value}
+                </span>
               </div>
 
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
@@ -712,13 +720,23 @@ export default function UranoWidget(): React.ReactElement {
               fontWeight: 800,
               cursor: canSendWallet ? "pointer" : "not-allowed",
               opacity: canSendWallet ? 1 : 0.6,
+              whiteSpace: "nowrap",
             }}
           >
-            {isSendingTx ? "Sending…" : account ? `Send ${txs.length} tx${txs.length > 1 ? "s" : ""} to wallet` : "Connect wallet"}
+            {isSendingTx
+              ? "Sending…"
+              : account
+                ? `Send ${txs.length} tx${txs.length > 1 ? "s" : ""} to wallet`
+                : "Connect wallet"}
           </button>
 
           {plan.docsUrl ? (
-            <a href={plan.docsUrl} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: "var(--text-secondary)" }}>
+            <a
+              href={plan.docsUrl}
+              target="_blank"
+              rel="noreferrer"
+              style={{ fontSize: 12, color: "var(--text-secondary)" }}
+            >
               Docs
             </a>
           ) : null}
@@ -741,7 +759,15 @@ export default function UranoWidget(): React.ReactElement {
     <div className="uw-shell">
       <div className={`uw-panel ${open ? "is-open" : "is-closed"}`}>
         <div className="uw-card gradient-border glass">
-          <div className="uw-header" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+          <div
+            className="uw-header"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: 12,
+            }}
+          >
             <div>
               <div className="uw-title">URANO Assistant</div>
               <div className="uw-subtitle">Ask about uShare sales, staking, governance.</div>
