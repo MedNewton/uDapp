@@ -9,6 +9,7 @@ import {
   type StreamEvent,
   type AssistantPlan,
   type TxPreview,
+  type ChatContext,
 } from "../lib/uassistantClient";
 
 import { thirdwebClient } from "../lib/thirdwebClient";
@@ -59,7 +60,10 @@ const MAX_HISTORY = 30;
 /* ----------------------------- Helpers ----------------------------- */
 
 function uid(): string {
-  return crypto.randomUUID();
+  const c = globalThis.crypto;
+  if (c && typeof c.randomUUID === "function") return c.randomUUID();
+  // Fallback: not cryptographically strong, but good enough for UI ids.
+  return `id_${Date.now()}_${Math.random().toString(16).slice(2)}`;
 }
 
 function shortHex(v: string, head = 6, tail = 4): string {
@@ -219,7 +223,10 @@ async function rpcCallWithFallback<T>(
   throw (lastErr instanceof Error ? lastErr : new Error("All RPCs failed"));
 }
 
-async function rpcGetReceipt(args: Readonly<{ txHash: `0x${string}`; signal?: AbortSignal }>): Promise<{ rpcUrl: string; receipt: RpcReceipt | null }> {
+async function rpcGetReceipt(args: Readonly<{ txHash: `0x${string}`; signal?: AbortSignal }>): Promise<{
+  rpcUrl: string;
+  receipt: RpcReceipt | null;
+}> {
   const payload = {
     jsonrpc: "2.0",
     id: 1,
@@ -231,7 +238,10 @@ async function rpcGetReceipt(args: Readonly<{ txHash: `0x${string}`; signal?: Ab
   return { rpcUrl, receipt: result ?? null };
 }
 
-async function waitForReceipt(args: Readonly<{ txHash: `0x${string}`; signal?: AbortSignal }>): Promise<{ rpcUrl: string; receipt: RpcReceipt }> {
+async function waitForReceipt(args: Readonly<{ txHash: `0x${string}`; signal?: AbortSignal }>): Promise<{
+  rpcUrl: string;
+  receipt: RpcReceipt;
+}> {
   const maxTries = 60;
   let delayMs = 1200;
 
@@ -263,10 +273,16 @@ function sanitizeTxError(raw: string): { headline: string; detail?: string } {
     const headline = sel
       ? `Transaction reverted with a custom contract error (${sel}).`
       : "Transaction reverted with a custom contract error.";
-    const detail =
-      sel
-        ? `This is a revert coming from the contract. The ABI you have locally doesn’t include this custom error, so it cannot be decoded.\n\nNext checks: (1) confirm you have enough token balance, (2) confirm contract addresses are correct for this chain, (3) confirm the protocol is active/not paused.\n\nLookup: https://openchain.xyz/signatures?query=${sel}`
-        : `This is a revert coming from the contract. Next checks: balance, addresses, paused/active state.`;
+    const detail = sel
+      ? `This is a revert coming from the contract. The ABI you have locally doesn’t include this custom error, so it cannot be decoded.
+
+Next checks:
+(1) confirm you have enough token balance,
+(2) confirm contract addresses are correct for this chain,
+(3) confirm the protocol is active/not paused.
+
+Lookup: https://openchain.xyz/signatures?query=${sel}`
+      : `This is a revert coming from the contract. Next checks: balance, addresses, paused/active state.`;
     return { headline, detail };
   }
   return { headline: raw };
@@ -286,6 +302,7 @@ export default function UranoWidget(): React.ReactElement {
 
   const listRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const messagesRef = useRef<Msg[]>(messages);
 
   // Thirdweb
   const account = useActiveAccount();
@@ -294,13 +311,20 @@ export default function UranoWidget(): React.ReactElement {
   const { mutateAsync: sendTx } = useSendTransaction();
 
   useEffect(() => {
+    messagesRef.current = messages;
+  }, [messages]);
+
+  useEffect(() => {
     if (!open) return;
     const el = listRef.current;
     if (!el) return;
     el.scrollTop = el.scrollHeight;
-  }, [open, messages.length]);
+  }, [open, messages]);
 
-  const canSend = useMemo(() => input.trim().length > 0 && !isStreaming, [input, isStreaming]);
+  const canSend = useMemo(
+    () => input.trim().length > 0 && !isStreaming && !isSendingTx,
+    [input, isStreaming, isSendingTx]
+  );
 
   function pushMessage(msg: Msg): void {
     setMessages((prev) => [...prev, msg]);
@@ -328,6 +352,11 @@ export default function UranoWidget(): React.ReactElement {
     })) satisfies ChatMessage[];
   }
 
+  function buildContext(): ChatContext | undefined {
+    if (!account?.address) return undefined;
+    return { account: account.address as `0x${string}` };
+  }
+
   async function startStreaming(payload: ChatMessage[], assistantId: string): Promise<void> {
     abortRef.current?.abort();
     const ac = new AbortController();
@@ -341,11 +370,10 @@ export default function UranoWidget(): React.ReactElement {
     try {
       await streamChat({
         messages: payload,
+        context: buildContext(),
         signal: ac.signal,
         onEvent: (evt: StreamEvent) => {
           if (evt.type === "plan") {
-            console.log("PLAN:", evt.plan);
-            console.log("TXS:", evt.plan.txs, "TX:", evt.plan.tx);
             planReceived = true;
 
             const plan = evt.plan;
@@ -354,7 +382,6 @@ export default function UranoWidget(): React.ReactElement {
             setMessages((prev) =>
               prev.map((m) => {
                 if (m.id !== assistantId) return m;
-
                 if (isActionablePlan(plan)) return { ...m, text, plan };
                 return { ...m, text, plan: undefined };
               })
@@ -399,40 +426,36 @@ export default function UranoWidget(): React.ReactElement {
 
   function onSend(): void {
     const text = input.trim();
-    if (!text || isStreaming) return;
+    if (!text || isStreaming || isSendingTx) return;
 
     const userMsg: Msg = { id: uid(), role: "user", text };
     const assistantId = uid();
     const assistantPlaceholder: Msg = { id: assistantId, role: "assistant", text: "" };
 
-    setMessages((prev) => [...prev, userMsg, assistantPlaceholder]);
     setInput("");
 
-    const nextForPayload = [...messages, userMsg];
+    // Use ref to avoid stale state when sending quickly during streaming updates.
+    const base = messagesRef.current;
+    const nextForPayload = [...base, userMsg];
     const payload = buildPayload(nextForPayload);
 
+    setMessages((prev) => [...prev, userMsg, assistantPlaceholder]);
     void startStreaming(payload, assistantId);
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLInputElement>): void {
-    if (e.key === "Enter") onSend();
+    if (e.key === "Enter") {
+      e.preventDefault();
+      onSend();
+    }
   }
 
-  async function erc20ReadUint256(args: {
-    token: HexAddress;
-    data: `0x${string}`;
-  }): Promise<bigint> {
+  async function erc20ReadUint256(args: { token: HexAddress; data: `0x${string}` }): Promise<bigint> {
     const payload = {
       jsonrpc: "2.0",
       id: 1,
       method: "eth_call",
-      params: [
-        {
-          to: args.token,
-          data: args.data,
-        },
-        "latest",
-      ],
+      params: [{ to: args.token, data: args.data }, "latest"],
     };
 
     const { result } = await rpcCallWithFallback<`0x${string}`>(payload);
@@ -466,9 +489,8 @@ export default function UranoWidget(): React.ReactElement {
   /**
    * Sends plan to wallet.
    * - Supports multi-tx plans (plan.txs) and legacy single tx (plan.tx).
-   * - IMPORTANT: For BUY_USHARE we do NOT do an extra client-side approval anymore,
-   *   because backend already returns approval + buy as txs[].
-   * - For STAKE we keep the client-side URANO approve BEFORE staking tx.
+   * - For BUY_USHARE we do NOT do an extra client-side approval anymore (backend already returns approve+buy).
+   * - For STAKE we keep the client-side URANO approve BEFORE staking tx (only if needed).
    */
   async function sendPlanToWallet(plan: AssistantPlan): Promise<void> {
     const txs = getPlanTxs(plan);
@@ -480,7 +502,9 @@ export default function UranoWidget(): React.ReactElement {
 
     // enforce single-chain batch
     for (const t of txs) {
-      if (t.chainId !== chainId) throw new Error("Plan contains transactions on multiple chains (not supported).");
+      if (t.chainId !== chainId) {
+        throw new Error("Plan contains transactions on multiple chains (not supported).");
+      }
     }
 
     if (!walletChain || walletChain.id !== chainId) {
@@ -510,7 +534,9 @@ export default function UranoWidget(): React.ReactElement {
       });
 
       const approveRes = await sendTx(approveTx);
-      if (!isSendTxResult(approveRes)) throw new Error("Unexpected approve result (missing transactionHash).");
+      if (!isSendTxResult(approveRes)) {
+        throw new Error("Unexpected approve result (missing transactionHash).");
+      }
 
       const { receipt: approveReceipt } = await waitForReceipt({ txHash: approveRes.transactionHash });
       if (approveReceipt.status && approveReceipt.status !== "0x1") {
@@ -588,9 +614,7 @@ export default function UranoWidget(): React.ReactElement {
         }}
       >
         <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 10 }}>
-          <div style={{ fontWeight: 800, fontSize: 13, color: "var(--text-primary)" }}>
-            {label} preview
-          </div>
+          <div style={{ fontWeight: 800, fontSize: 13, color: "var(--text-primary)" }}>{label} preview</div>
 
           <div
             style={{
@@ -607,9 +631,7 @@ export default function UranoWidget(): React.ReactElement {
           </div>
         </div>
 
-        <div style={{ marginTop: 6, fontSize: 12, color: "var(--text-secondary)" }}>
-          {plan.interpretation}
-        </div>
+        <div style={{ marginTop: 6, fontSize: 12, color: "var(--text-secondary)" }}>{plan.interpretation}</div>
 
         {plan.warnings?.length > 0 && (
           <div
@@ -652,23 +674,17 @@ export default function UranoWidget(): React.ReactElement {
             <div style={{ display: "grid", gap: 6 }}>
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
                 <span style={{ color: "var(--text-secondary)" }}>Chain</span>
-                <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-                  {t.chainId}
-                </span>
+                <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>{t.chainId}</span>
               </div>
 
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
                 <span style={{ color: "var(--text-secondary)" }}>To</span>
-                <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-                  {shortHex(t.to)}
-                </span>
+                <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>{shortHex(t.to)}</span>
               </div>
 
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
                 <span style={{ color: "var(--text-secondary)" }}>Value</span>
-                <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-                  {t.value}
-                </span>
+                <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>{t.value}</span>
               </div>
 
               <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
@@ -698,21 +714,22 @@ export default function UranoWidget(): React.ReactElement {
               opacity: canSendWallet ? 1 : 0.6,
             }}
           >
-            {isSendingTx
-              ? "Sending…"
-              : account
-                ? `Send ${txs.length} tx${txs.length > 1 ? "s" : ""} to wallet`
-                : "Connect wallet"}
+            {isSendingTx ? "Sending…" : account ? `Send ${txs.length} tx${txs.length > 1 ? "s" : ""} to wallet` : "Connect wallet"}
           </button>
 
           {plan.docsUrl ? (
-            <a
-              href={plan.docsUrl}
-              target="_blank"
-              rel="noreferrer"
-              style={{ fontSize: 12, color: "var(--text-secondary)" }}
-            >
+            <a href={plan.docsUrl} target="_blank" rel="noreferrer" style={{ fontSize: 12, color: "var(--text-secondary)" }}>
               Docs
+            </a>
+          ) : null}
+
+          {plan.supportEmail ? (
+            <a
+              href={`mailto:${plan.supportEmail}`}
+              style={{ fontSize: 12, color: "var(--text-secondary)" }}
+              title={plan.supportEmail}
+            >
+              Support
             </a>
           ) : null}
         </div>
@@ -724,10 +741,7 @@ export default function UranoWidget(): React.ReactElement {
     <div className="uw-shell">
       <div className={`uw-panel ${open ? "is-open" : "is-closed"}`}>
         <div className="uw-card gradient-border glass">
-          <div
-            className="uw-header"
-            style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}
-          >
+          <div className="uw-header" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
             <div>
               <div className="uw-title">URANO Assistant</div>
               <div className="uw-subtitle">Ask about uShare sales, staking, governance.</div>
@@ -755,7 +769,7 @@ export default function UranoWidget(): React.ReactElement {
                       ? "uw-msg-user"
                       : m.role === "error"
                         ? "uw-msg-error"
-                        : "uw-msg-system",
+                        : "uw-msg-status",
                 ].join(" ")}
               >
                 {m.text}
@@ -771,7 +785,7 @@ export default function UranoWidget(): React.ReactElement {
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={onKeyDown}
               placeholder={isStreaming ? "Assistant is typing…" : "Type a message…"}
-              disabled={isStreaming}
+              disabled={isStreaming || isSendingTx}
             />
             <button className="uw-send" onClick={onSend} disabled={!canSend}>
               Send

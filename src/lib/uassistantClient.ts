@@ -1,4 +1,5 @@
 // src/lib/uassistantClient.ts
+
 export type ChatRole = "user" | "assistant";
 
 export type ChatMessage = Readonly<{
@@ -40,6 +41,21 @@ export type AssistantPlan = Readonly<{
   supportEmail?: string;
 }>;
 
+/** Must match backend ChatBodySchema "context" shape (subset). */
+export type ChatContext = Readonly<{
+  account?: `0x${string}`;
+  vesting?: Readonly<{
+    data: Readonly<{
+      beneficiary: `0x${string}`;
+      totalAmount: string;
+      cliffInSeconds: string;
+      vestingInSeconds: string;
+      tgePercentage: string;
+    }>;
+    merkleProof: readonly `0x${string}`[];
+  }>;
+}>;
+
 export type StreamEvent =
   | { type: "ready"; id?: string }
   | { type: "plan"; plan: AssistantPlan }
@@ -54,7 +70,10 @@ function assertEnv(name: string, value: string | undefined): string {
 }
 
 const API_BASE = (() => {
-  const raw = assertEnv("VITE_UASSISTANT_API_BASE", import.meta.env.VITE_UASSISTANT_API_BASE);
+  const raw = assertEnv(
+    "VITE_UASSISTANT_API_BASE",
+    import.meta.env.VITE_UASSISTANT_API_BASE
+  );
   return raw.endsWith("/") ? raw.slice(0, -1) : raw;
 })();
 
@@ -64,10 +83,14 @@ const API_KEY = (() => {
 
 export async function streamChat(args: Readonly<{
   messages: readonly ChatMessage[];
+  context?: ChatContext;
   signal?: AbortSignal;
   onEvent: (evt: StreamEvent) => void;
 }>): Promise<void> {
-  const { messages, signal, onEvent } = args;
+  const { messages, context, signal, onEvent } = args;
+
+  const body: { messages: readonly ChatMessage[]; context?: ChatContext } = { messages };
+  if (context) body.context = context;
 
   const res = await fetch(`${API_BASE}/chat/stream`, {
     method: "POST",
@@ -76,7 +99,7 @@ export async function streamChat(args: Readonly<{
       accept: "text/event-stream",
       "x-api-key": API_KEY,
     },
-    body: JSON.stringify({ messages }),
+    body: JSON.stringify(body),
     signal,
   });
 
@@ -94,6 +117,9 @@ export async function streamChat(args: Readonly<{
   let currentEvent: string | null = null;
 
   const flushBlock = (block: string): void => {
+    // Ignore SSE comment / keep-alive blocks like ": ping"
+    if (/^\s*:\s*/m.test(block)) return;
+
     const lines = block.split("\n");
     let ev: string | null = null;
     const dataLines: string[] = [];
@@ -149,7 +175,11 @@ export async function streamChat(args: Readonly<{
     if (eventName === "error") {
       try {
         const parsed = JSON.parse(dataRaw) as { error?: string; message?: string };
-        onEvent({ type: "error", error: parsed.error ?? "ERROR", message: parsed.message });
+        onEvent({
+          type: "error",
+          error: parsed.error ?? "ERROR",
+          message: parsed.message,
+        });
       } catch {
         onEvent({ type: "error", error: "ERROR", message: dataRaw });
       }
