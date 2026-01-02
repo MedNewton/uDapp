@@ -1,3 +1,4 @@
+// src/lib/uassistantClient.ts
 export type ChatRole = "user" | "assistant";
 
 export type ChatMessage = Readonly<{
@@ -9,7 +10,7 @@ export type TxPreview = Readonly<{
   chainId: number;
   to: `0x${string}`;
   data: `0x${string}`;
-  value: string; // bigint string
+  value: string;
 }>;
 
 export type AssistantPlan = Readonly<{
@@ -47,10 +48,7 @@ function assertEnv(name: string, value: string | undefined): string {
 }
 
 const API_BASE = (() => {
-  const raw = assertEnv(
-    "VITE_UASSISTANT_API_BASE",
-    import.meta.env.VITE_UASSISTANT_API_BASE
-  );
+  const raw = assertEnv("VITE_UASSISTANT_API_BASE", import.meta.env.VITE_UASSISTANT_API_BASE);
   return raw.endsWith("/") ? raw.slice(0, -1) : raw;
 })();
 
@@ -58,10 +56,6 @@ const API_KEY = (() => {
   return assertEnv("VITE_UASSISTANT_API_KEY", import.meta.env.VITE_UASSISTANT_API_KEY);
 })();
 
-/**
- * Streams assistant output from /chat/stream as Server-Sent Events (SSE).
- * Calls `onEvent` for ready/plan/delta/done/error.
- */
 export async function streamChat(args: Readonly<{
   messages: readonly ChatMessage[];
   signal?: AbortSignal;
@@ -121,9 +115,8 @@ export async function streamChat(args: Readonly<{
       try {
         const parsed = JSON.parse(dataRaw) as AssistantPlan;
         onEvent({ type: "plan", plan: parsed });
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        onEvent({ type: "error", error: "PLAN_PARSE_FAILED", message: msg });
+      } catch {
+        onEvent({ type: "error", error: "BAD_PLAN_EVENT", message: "Could not parse plan payload." });
       }
       return;
     }
@@ -146,15 +139,10 @@ export async function streamChat(args: Readonly<{
     if (eventName === "error") {
       try {
         const parsed = JSON.parse(dataRaw) as { error?: string; message?: string };
-        onEvent({
-          type: "error",
-          error: parsed.error ?? "ERROR",
-          message: parsed.message,
-        });
+        onEvent({ type: "error", error: parsed.error ?? "ERROR", message: parsed.message });
       } catch {
         onEvent({ type: "error", error: "ERROR", message: dataRaw });
       }
-      return;
     }
   };
 
