@@ -8,9 +8,11 @@ import {
   type ChatMessage,
   type StreamEvent,
   type AssistantPlan,
+  type ChatContext,
+  type TxPreview,
 } from "../lib/uassistantClient";
 
-import { thirdwebClient } from "../lib/thidwebClient";
+import { thirdwebClient } from "../lib/thirdwebClient";
 
 import {
   ConnectButton,
@@ -30,10 +32,6 @@ type Msg = Readonly<{
   id: string;
   role: MsgRole;
   text: string;
-  /**
-   * Only attach plan when it is ACTIONABLE (plan.tx !== null and not QUESTION/UNSUPPORTED).
-   * This prevents a “card” for messages like "hi".
-   */
   plan?: AssistantPlan;
 }>;
 
@@ -54,8 +52,6 @@ type JsonRpcResponse<T> = Readonly<{
 type HexAddress = `0x${string}`;
 
 const MAX_HISTORY = 30;
-
-const MAX_UINT256 = 2n ** 256n - 1n;
 
 /* ----------------------------- Helpers ----------------------------- */
 
@@ -88,8 +84,8 @@ function actionLabel(actionType: AssistantPlan["actionType"]): string {
       return "Sell uShare";
     case "VOTE":
       return "Governance vote";
-    case "CLAIM_UNLOCKED":
-      return "Claim unlocked";
+    case "CLAIM_VESTING":
+      return "Claim vesting";
     case "QUESTION":
       return "Info";
     case "UNSUPPORTED":
@@ -99,9 +95,9 @@ function actionLabel(actionType: AssistantPlan["actionType"]): string {
   }
 }
 
-/** Only show a card when plan is actionable. */
 function isActionablePlan(plan: AssistantPlan): boolean {
-  if (!plan.tx) return false;
+  const hasTxs = Array.isArray(plan.txs) && plan.txs.length > 0;
+  if (!hasTxs) return false;
   if (plan.actionType === "QUESTION") return false;
   if (plan.actionType === "UNSUPPORTED") return false;
   return true;
@@ -109,7 +105,6 @@ function isActionablePlan(plan: AssistantPlan): boolean {
 
 /** Extract first uint256 arg from calldata: 0x + 4-byte selector + 32-byte arg0 + ... */
 function decodeFirstUint256Arg(data: `0x${string}`): bigint {
-  // "0x" + 8 hex selector = 10 chars, then arg0 64 hex chars
   if (data.length < 10 + 64) throw new Error("Invalid calldata (too short)");
   const arg0 = data.slice(10, 10 + 64);
   return BigInt(`0x${arg0}`);
@@ -127,12 +122,22 @@ function isSendTxResult(v: unknown): v is SendTxResult {
   return typeof h === "string" && h.startsWith("0x");
 }
 
-function encodeErc20Approve(spender: HexAddress, amount: bigint): `0x${string}` {
-  // approve(address,uint256) selector = 0x095ea7b3
-  const selector = "0x095ea7b3";
-  const spenderPadded = spender.slice(2).padStart(64, "0");
-  const amountPadded = amount.toString(16).padStart(64, "0");
-  return `${selector}${spenderPadded}${amountPadded}` as `0x${string}`;
+function sanitizeTxError(raw: string): { headline: string; detail?: string } {
+  if (raw.includes("Encoded error signature") || raw.includes("decodeErrorResult")) {
+    const sel = extractErrorSelector(raw);
+    const headline = sel
+      ? `Transaction reverted with a custom contract error (${sel}).`
+      : "Transaction reverted with a custom contract error.";
+    const detail = sel
+      ? `This is a revert coming from the contract. The ABI you have locally doesn’t include this custom error, so it cannot be decoded.
+
+Next checks: balance, correct addresses for this chain, paused/active state.
+
+Lookup: https://openchain.xyz/signatures?query=${sel}`
+      : `This is a revert coming from the contract. Next checks: balance, addresses, paused/active state.`;
+    return { headline, detail };
+  }
+  return { headline: raw };
 }
 
 /* ---------- Minimal ERC20 reads via RPC (balanceOf / allowance) ---------- */
@@ -161,15 +166,14 @@ function parseUint256Hex(result: unknown): bigint {
 }
 
 function pickRpcUrls(): string[] {
-  // Prefer your env, then Base Sepolia defaults + fallback publicnode.
   const envRpc = (import.meta.env.VITE_RPC_URL as string | undefined)?.trim();
   const list = [
     envRpc && envRpc.length > 0 ? envRpc : null,
-    "https://sepolia.base.org",
-    "https://base-sepolia-rpc.publicnode.com",
+    // Arbitrum Sepolia fallbacks
+    "https://sepolia-rollup.arbitrum.io/rpc",
+    "https://arbitrum-sepolia-rpc.publicnode.com",
   ].filter(Boolean) as string[];
 
-  // de-dupe
   return Array.from(new Set(list));
 }
 
@@ -249,22 +253,16 @@ async function waitForReceipt(args: Readonly<{ txHash: `0x${string}`; signal?: A
   throw new Error("Timed out waiting for transaction receipt");
 }
 
-function sanitizeTxError(raw: string): { headline: string; detail?: string } {
-  // Common viem/thirdweb decode message for custom errors
-  if (raw.includes("Encoded error signature") || raw.includes("decodeErrorResult")) {
-    const sel = extractErrorSelector(raw);
-    const headline = sel
-      ? `Transaction reverted with a custom contract error (${sel}).`
-      : "Transaction reverted with a custom contract error.";
-    const detail =
-      sel
-        ? `This is a revert coming from the contract. The ABI you have locally doesn’t include this custom error, so it cannot be decoded.\n\nNext checks: (1) confirm you have enough token balance, (2) confirm URANO token + staking addresses are correct for this chain, (3) confirm staking is active/not paused.\n\nLookup: https://openchain.xyz/signatures?query=${sel}`
-        : `This is a revert coming from the contract. Next checks: balance, addresses, paused/active state.`;
-    return { headline, detail };
-  }
+async function erc20ReadUint256(args: { token: HexAddress; data: `0x${string}` }): Promise<bigint> {
+  const payload = {
+    jsonrpc: "2.0",
+    id: 1,
+    method: "eth_call",
+    params: [{ to: args.token, data: args.data }, "latest"],
+  };
 
-  // Default
-  return { headline: raw };
+  const { result } = await rpcCallWithFallback<`0x${string}`>(payload);
+  return parseUint256Hex(result);
 }
 
 /* ----------------------------- Component ----------------------------- */
@@ -314,7 +312,7 @@ export default function UranoWidget(): React.ReactElement {
 
   function buildPayload(nextMsgs: readonly Msg[]): ChatMessage[] {
     const sliced = nextMsgs
-      .filter((m) => m.role === "user" || m.role === "assistant") // only chat roles go to LLM
+      .filter((m) => m.role === "user" || m.role === "assistant")
       .slice(Math.max(0, nextMsgs.length - MAX_HISTORY));
 
     return sliced.map((m) => ({
@@ -323,25 +321,27 @@ export default function UranoWidget(): React.ReactElement {
     })) satisfies ChatMessage[];
   }
 
+  function buildContext(): ChatContext | undefined {
+    if (!account?.address) return undefined;
+    return { account: account.address as `0x${string}` };
+  }
+
   async function startStreaming(payload: ChatMessage[], assistantId: string): Promise<void> {
     abortRef.current?.abort();
     const ac = new AbortController();
     abortRef.current = ac;
 
     setIsStreaming(true);
-
-    // CRITICAL FIX: once we receive a "plan" event, we ignore any subsequent "delta"
-    // (your backend currently emits plan -> delta(out.userMessage), which otherwise duplicates text)
     let planReceived = false;
 
     try {
       await streamChat({
         messages: payload,
+        context: buildContext(),
         signal: ac.signal,
         onEvent: (evt: StreamEvent) => {
           if (evt.type === "plan") {
             planReceived = true;
-
             const plan = evt.plan;
 
             setMessages((prev) =>
@@ -349,11 +349,8 @@ export default function UranoWidget(): React.ReactElement {
                 if (m.id !== assistantId) return m;
 
                 const text = plan.userMessage ?? "";
-
-                // attach plan ONLY if actionable => card only for real transactions
                 if (isActionablePlan(plan)) return { ...m, text, plan };
 
-                // ensure plan is removed for non-actionable ("hi", questions, unsupported)
                 return { ...m, text, plan: undefined };
               })
             );
@@ -361,7 +358,6 @@ export default function UranoWidget(): React.ReactElement {
           }
 
           if (evt.type === "delta") {
-            // Ignore deltas after plan to prevent duplicates
             if (planReceived) return;
 
             const delta = evt.delta ?? "";
@@ -370,7 +366,7 @@ export default function UranoWidget(): React.ReactElement {
             setMessages((prev) =>
               prev.map((m) => {
                 if (m.id !== assistantId) return m;
-                if (m.plan) return m; // ignore deltas once a plan card is attached
+                if (m.plan) return m;
                 return { ...m, text: m.text + delta };
               })
             );
@@ -378,7 +374,6 @@ export default function UranoWidget(): React.ReactElement {
           }
 
           if (evt.type === "error") {
-            // Do not append into the assistant text; create a separate error message
             pushMessage({
               id: uid(),
               role: "error",
@@ -419,27 +414,6 @@ export default function UranoWidget(): React.ReactElement {
     if (e.key === "Enter") onSend();
   }
 
-  async function erc20ReadUint256(args: {
-    token: HexAddress;
-    data: `0x${string}`;
-  }): Promise<bigint> {
-    const payload = {
-      jsonrpc: "2.0",
-      id: 1,
-      method: "eth_call",
-      params: [
-        {
-          to: args.token,
-          data: args.data,
-        },
-        "latest",
-      ],
-    };
-
-    const { result } = await rpcCallWithFallback<`0x${string}`>(payload);
-    return parseUint256Hex(result);
-  }
-
   async function preflightStake(args: {
     token: HexAddress;
     owner: HexAddress;
@@ -457,102 +431,36 @@ export default function UranoWidget(): React.ReactElement {
       );
     }
 
-    // allowance check is still useful after approve (in case approve was for a different spender/token)
     if (allow < args.amountWei) {
       throw new Error(
-        `Allowance is still insufficient after approval. Allowance=${allow.toString()} wei, need ${args.amountWei.toString()} wei.`
+        `Allowance is insufficient. Allowance=${allow.toString()} wei, need ${args.amountWei.toString()} wei.`
       );
     }
   }
 
-  async function sendPlanToWallet(plan: AssistantPlan): Promise<void> {
-    if (!plan.tx) throw new Error("No transaction to send.");
+  function txLabelForIndex(plan: AssistantPlan, idx: number, tx: TxPreview): string {
+    // simple UX labels
+    const selector = tx.data.slice(0, 10).toLowerCase();
+    if (selector === "0x095ea7b3") return `Tx ${idx + 1}: Approve`;
+    if (plan.actionType === "BUY_USHARE" && idx === 1) return `Tx ${idx + 1}: Buy`;
+    return `Tx ${idx + 1}`;
+  }
+
+  async function sendTxPreview(txp: TxPreview): Promise<void> {
     if (!account?.address) throw new Error("Connect your wallet first.");
 
-    const chain = defineChain(plan.tx.chainId);
+    const chain = defineChain(txp.chainId);
 
-    if (!walletChain || walletChain.id !== plan.tx.chainId) {
+    if (!walletChain || walletChain.id !== txp.chainId) {
       await switchChain(chain);
     }
-
-    const owner = account.address as HexAddress;
-
-    // -------- 1) Pre-approval steps --------
-
-    if (plan.actionType === "STAKE") {
-      const tokenRaw = (import.meta.env.VITE_URANO_TOKEN as string | undefined)?.trim();
-      if (!tokenRaw || !isHexAddress(tokenRaw)) {
-        throw new Error("Missing/invalid VITE_URANO_TOKEN in frontend env.");
-      }
-
-      const stakeAmountWei = decodeFirstUint256Arg(plan.tx.data);
-
-      pushMessage({ id: uid(), role: "system", text: "Preparing approval…" });
-
-      const approveTx = prepareTransaction({
-        client: thirdwebClient,
-        chain,
-        to: tokenRaw,
-        data: encodeErc20Approve(plan.tx.to as HexAddress, stakeAmountWei),
-        value: 0n,
-      });
-
-      const approveRes = await sendTx(approveTx);
-      if (!isSendTxResult(approveRes)) throw new Error("Unexpected approve result (missing transactionHash).");
-
-      const { receipt: approveReceipt } = await waitForReceipt({ txHash: approveRes.transactionHash });
-      if (approveReceipt.status && approveReceipt.status !== "0x1") {
-        throw new Error(`Approve reverted (status=${approveReceipt.status}).`);
-      }
-
-      pushMessage({ id: uid(), role: "system", text: "Approval confirmed." });
-
-      // Preflight read checks (balance + allowance)
-      await preflightStake({
-        token: tokenRaw,
-        owner,
-        spender: plan.tx.to as HexAddress,
-        amountWei: stakeAmountWei,
-      });
-    }
-
-    if (plan.actionType === "BUY_USHARE") {
-      const usdcRaw = (import.meta.env.VITE_USDC_TOKEN as string | undefined)?.trim();
-      if (!usdcRaw || !isHexAddress(usdcRaw)) {
-        throw new Error("Missing/invalid VITE_USDC_TOKEN in frontend env.");
-      }
-
-      pushMessage({ id: uid(), role: "system", text: "Preparing USDC approval…" });
-
-      const approveTx = prepareTransaction({
-        client: thirdwebClient,
-        chain,
-        to: usdcRaw,
-        data: encodeErc20Approve(plan.tx.to as HexAddress, MAX_UINT256),
-        value: 0n,
-      });
-
-      const approveRes = await sendTx(approveTx);
-      if (!isSendTxResult(approveRes)) throw new Error("Unexpected approve result (missing transactionHash).");
-
-      const { receipt: approveReceipt } = await waitForReceipt({ txHash: approveRes.transactionHash });
-      if (approveReceipt.status && approveReceipt.status !== "0x1") {
-        throw new Error(`USDC approve reverted (status=${approveReceipt.status}).`);
-      }
-
-      pushMessage({ id: uid(), role: "system", text: "USDC approval confirmed." });
-    }
-
-    // -------- 2) Send the planned tx --------
-
-    pushMessage({ id: uid(), role: "system", text: "Preparing transaction…" });
 
     const tx = prepareTransaction({
       client: thirdwebClient,
       chain,
-      to: plan.tx.to,
-      data: plan.tx.data,
-      value: BigInt(plan.tx.value),
+      to: txp.to,
+      data: txp.data,
+      value: BigInt(txp.value),
     });
 
     const res = await sendTx(tx);
@@ -562,8 +470,80 @@ export default function UranoWidget(): React.ReactElement {
     if (receipt.status && receipt.status !== "0x1") {
       throw new Error(`Transaction reverted (status=${receipt.status}).`);
     }
+  }
 
-    pushMessage({ id: uid(), role: "system", text: "Transaction confirmed." });
+  async function sendPlanToWallet(plan: AssistantPlan): Promise<void> {
+    if (!account?.address) throw new Error("Connect your wallet first.");
+    if (!isActionablePlan(plan)) throw new Error("This message has no actionable transaction.");
+
+    const owner = account.address as HexAddress;
+
+    // Use multi-tx as source of truth; fallback to legacy field.
+    const planTxs: TxPreview[] =
+      plan.txs && plan.txs.length > 0 ? [...plan.txs] : plan.tx ? [plan.tx] : [];
+
+    if (planTxs.length === 0) throw new Error("No transaction(s) to send.");
+
+    // Optional client-side STAKE approval (only if backend did NOT already include it).
+    if (plan.actionType === "STAKE") {
+      const uranoTokenRaw = (import.meta.env.VITE_URANO_TOKEN as string | undefined)?.trim();
+      if (!uranoTokenRaw || !isHexAddress(uranoTokenRaw)) {
+        throw new Error("Missing/invalid VITE_URANO_TOKEN in frontend env.");
+      }
+
+      // If the backend ever returns an approve tx already, do NOT duplicate it.
+      const hasApproveAlready = planTxs.some(
+        (t) => t.to.toLowerCase() === uranoTokenRaw.toLowerCase() && t.data.slice(0, 10).toLowerCase() === "0x095ea7b3"
+      );
+
+      if (!hasApproveAlready) {
+        const stakeTx = planTxs[0]!;
+        const stakeAmountWei = decodeFirstUint256Arg(stakeTx.data);
+
+        pushMessage({ id: uid(), role: "system", text: "Preparing URANO approval…" });
+
+        // Use thirdweb ERC20 approve write helper? You can, but raw calldata is fine.
+        // approve(address spender, uint256 amount)
+        const selector = "0x095ea7b3";
+        const spenderPadded = stakeTx.to.slice(2).padStart(64, "0");
+        const amountPadded = stakeAmountWei.toString(16).padStart(64, "0");
+        const approveData = `${selector}${spenderPadded}${amountPadded}` as `0x${string}`;
+
+        await sendTxPreview({
+          chainId: stakeTx.chainId,
+          to: uranoTokenRaw,
+          data: approveData,
+          value: "0",
+        });
+
+        pushMessage({ id: uid(), role: "system", text: "URANO approval confirmed." });
+
+        await preflightStake({
+          token: uranoTokenRaw,
+          owner,
+          spender: stakeTx.to as HexAddress,
+          amountWei: stakeAmountWei,
+        });
+      }
+    }
+
+    // Send all planned txs sequentially (this is the critical fix for BUY_USHARE).
+    for (let i = 0; i < planTxs.length; i += 1) {
+      const txp = planTxs[i]!;
+      pushMessage({
+        id: uid(),
+        role: "system",
+        text: `Sending ${txLabelForIndex(plan, i, txp)}…`,
+      });
+
+      await sendTxPreview(txp);
+
+      pushMessage({
+        id: uid(),
+        role: "system",
+        text: `${txLabelForIndex(plan, i, txp)} confirmed.`,
+      });
+    }
   }
 
   async function onClickSendToWallet(plan: AssistantPlan): Promise<void> {
@@ -585,10 +565,12 @@ export default function UranoWidget(): React.ReactElement {
   }
 
   function renderAssistantPlan(plan: AssistantPlan): React.ReactElement {
-    if (!plan.tx) return <></>;
+    if (!isActionablePlan(plan)) return <></>;
 
     const label = actionLabel(plan.actionType);
     const canSendWallet = Boolean(account) && !isSendingTx;
+
+    const txs = plan.txs && plan.txs.length > 0 ? plan.txs : plan.tx ? [plan.tx] : [];
 
     return (
       <div
@@ -656,36 +638,56 @@ export default function UranoWidget(): React.ReactElement {
             color: "var(--text-primary)",
           }}
         >
-          <div style={{ fontWeight: 700, marginBottom: 8 }}>Transaction</div>
+          <div style={{ fontWeight: 700, marginBottom: 8 }}>
+            Transactions ({txs.length})
+          </div>
 
-          <div style={{ display: "grid", gap: 6 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-              <span style={{ color: "var(--text-secondary)" }}>Chain</span>
-              <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-                {plan.tx.chainId}
-              </span>
-            </div>
+          <div style={{ display: "grid", gap: 10 }}>
+            {txs.map((t, idx) => (
+              <div
+                key={`${t.to}-${t.data}-${idx}`}
+                style={{
+                  borderRadius: 10,
+                  border: "1px solid rgba(255,255,255,0.08)",
+                  padding: 10,
+                  background: "rgba(0,0,0,0.18)",
+                }}
+              >
+                <div style={{ fontWeight: 800, marginBottom: 8 }}>
+                  {txLabelForIndex(plan, idx, t)}
+                </div>
 
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-              <span style={{ color: "var(--text-secondary)" }}>To</span>
-              <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-                {shortHex(plan.tx.to)}
-              </span>
-            </div>
+                <div style={{ display: "grid", gap: 6 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                    <span style={{ color: "var(--text-secondary)" }}>Chain</span>
+                    <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                      {t.chainId}
+                    </span>
+                  </div>
 
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-              <span style={{ color: "var(--text-secondary)" }}>Value</span>
-              <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-                {plan.tx.value}
-              </span>
-            </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                    <span style={{ color: "var(--text-secondary)" }}>To</span>
+                    <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                      {shortHex(t.to)}
+                    </span>
+                  </div>
 
-            <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
-              <span style={{ color: "var(--text-secondary)" }}>Data</span>
-              <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
-                {shortHex(plan.tx.data, 10, 8)}
-              </span>
-            </div>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                    <span style={{ color: "var(--text-secondary)" }}>Value</span>
+                    <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                      {t.value}
+                    </span>
+                  </div>
+
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                    <span style={{ color: "var(--text-secondary)" }}>Data</span>
+                    <span style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace" }}>
+                      {shortHex(t.data, 10, 8)}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            ))}
           </div>
         </div>
 
@@ -763,7 +765,7 @@ export default function UranoWidget(): React.ReactElement {
                 ].join(" ")}
               >
                 {m.text}
-                {m.role === "assistant" && m.plan?.tx ? renderAssistantPlan(m.plan) : null}
+                {m.role === "assistant" && m.plan ? renderAssistantPlan(m.plan) : null}
               </div>
             ))}
           </div>
