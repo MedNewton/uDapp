@@ -1,6 +1,7 @@
 // src/components/UranoWidget.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
-import { TbMessageChatbot } from "react-icons/tb";
+import { FaUserAstronaut } from "react-icons/fa";
+
 import "../styles/uranoWidget.css";
 
 import {
@@ -834,7 +835,7 @@ export default function UranoWidget(): React.ReactElement {
             ×
           </span>
         ) : (
-          <TbMessageChatbot className="uw-fab-icon" aria-hidden />
+          <FaUserAstronaut className="uw-fab-icon" aria-hidden />
         )}
       </button>
     </div>
