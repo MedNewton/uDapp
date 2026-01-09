@@ -294,8 +294,16 @@ export default function UranoWidget(): React.ReactElement {
   const [isSendingTx, setIsSendingTx] = useState<boolean>(false);
 
   const [messages, setMessages] = useState<Msg[]>(() => [
-    { id: uid(), role: "assistant", text: "Hello. How can I help you today?" },
+    {
+      id: uid(),
+      role: "assistant",
+      text: `Hello — I’m uAssistant, Urano’s AI agent and conversational interface.
+Use natural language to buy or stake $URANO, participate in governance, or interact with uShares.
+I can answer questions about Urano and RWAs, and show your balances, vesting status, and available listings.
+I’m non-custodial: I never access private keys. Every on-chain action requires a transaction preview and your wallet signature.`,
+    },
   ]);
+  
 
   const listRef = useRef<HTMLDivElement | null>(null);
   const abortRef = useRef<AbortController | null>(null);
@@ -821,7 +829,7 @@ export default function UranoWidget(): React.ReactElement {
               disabled={isStreaming || isSendingTx}
             />
             <button className="uw-send" onClick={onSend} disabled={!canSend}>
-              Send
+            Ask uAssistant…
             </button>
           </div>
         </div>
