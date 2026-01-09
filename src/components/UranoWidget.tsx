@@ -1,6 +1,7 @@
 // src/components/UranoWidget.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { FaUserAstronaut } from "react-icons/fa";
+import logo from "../assets/logo-raw-2.webp"
 
 import "../styles/uranoWidget.css";
 
@@ -772,7 +773,10 @@ export default function UranoWidget(): React.ReactElement {
             }}
           >
             <div>
-              <div className="uw-title">URANO Assistant</div>
+              <div className="uw-title-wrapper">
+                <img className="uw-title-logo" src={logo} alt="urano logo" />
+                <div className="uw-title">uAssistant</div>
+              </div>
               <div className="uw-subtitle">Ask about uShare sales, staking, governance.</div>
             </div>
 

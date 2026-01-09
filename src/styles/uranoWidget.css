@@ -82,10 +82,24 @@
   gap: 10px;
 }
 
+.uw-title-wrapper{
+  display: flex;
+  flex-direction: row;
+  align-items: center;
+  justify-content: start;
+  gap: 0.25rem;
+  margin-bottom: 0.25rem;
+}
+
+.uw-title-logo{
+  width: 32px;
+  height: 24px;
+}
+
 .uw-title {
-  font-size: 14px;
+  font-size: 18px !important;
   font-weight: 700;
-  color: var(--text-primary);
+  color: #22C0B8 !important;
 }
 
 .uw-subtitle {
